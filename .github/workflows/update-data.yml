@@ -1,0 +1,62 @@
+name: 更新 40日收益差数据
+
+on:
+  schedule:
+    # 北京时间 16:30（UTC 08:30），周一至周五收盘后
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 拉取 Wind 数据并生成 data.json
+        env:
+          WIND_API_KEY: ${{ secrets.WIND_API_KEY }}
+        run: python scripts/fetch_data.py --out data/data.json
+
+      - name: 校验数据文件非空
+        run: |
+          set -e
+          test -s data/data.json
+          test -s data/data.js
+          python - <<'PY'
+          import json, re
+          d = json.load(open("data/data.json", encoding="utf-8"))
+          assert d["series"]["dates"], "dates 为空"
+          assert d["latest"]["spread_wind"] is not None, "最新收益差为空"
+          # data.js 内联数据与 data.json 必须完全一致
+          js = open("data/data.js", encoding="utf-8").read()
+          m = re.search(r"window\.__SPREAD_DATA__=(\{.*\});\s*$", js, re.S)
+          assert m, "data.js 未找到 window.__SPREAD_DATA__"
+          assert json.loads(m.group(1)) == d, "data.js 与 data.json 不一致"
+          print("OK  数据截至 %s  最新收益差 %.2f%%  交易日 %d"
+                % (d["meta"]["end"], d["latest"]["spread_wind"], d["meta"]["trading_days"]))
+          PY
+
+      - name: 提交变更
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/data.json data/data.js
+          if git diff --staged --quiet; then
+            echo "数据无变化，跳过提交"
+          else
+            git commit -m "chore(data): 更新 40日收益差数据 $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
