@@ -255,8 +255,16 @@
           var d = ps[0].axisValue;
           var row = '<div class="tt-date">' + d + '</div>';
           ps.forEach(function (p) {
-            if (p.seriesName === '收益差' && p.value[1] !== null) {
-              row += '<div class="tt-row"><span class="tt-dot" style="background:' + COLOR.spread + '"></span>收益差 <b>' + fmtPct(p.value[1], 2) + '</b></div>';
+            if (p.seriesName !== '收益差') return;
+            // 类目轴 + 数值数组时 p.value 本身就是数字；兼容 [x, y] 形式
+            var v = (p.value !== null && typeof p.value === 'object') ? p.value[1] : p.value;
+            row += '<div class="tt-row"><span class="tt-dot" style="background:' + COLOR.spread + '"></span>' +
+              '收益差 <b>' + fmtPct(v, 2) + '</b></div>';
+            if (state.raw && state.raw.pos) {
+              var held = state.raw.pos[p.dataIndex] === 1;
+              row += '<div class="tt-row"><span class="tt-dot" style="background:' +
+                (held ? COLOR.strat : COLOR.zero) + '"></span>' +
+                '仓位 <b>' + (held ? '持有' : '空仓') + '</b></div>';
             }
           });
           return row;
