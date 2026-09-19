@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中证红利 40日收益差择时看板</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  :root{
+    --bg:#f7f7f5; --card:#ffffff; --line:#E5E4DF; --soft:#F1EFE8;
+    --t1:#1F1F1D; --t2:#5F5E5A; --t3:#888780;
+    --blue:#185FA5; --blue-l:#378ADD; --orange:#D85A30; --green:#1D9E75;
+    --radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--t1);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:14px; line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1220px; margin:0 auto; padding:28px 20px 56px}
+  header{display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:20px}
+  h1{font-size:20px; font-weight:600; margin:0 0 4px; letter-spacing:.2px}
+  .sub{font-size:12.5px; color:var(--t3)}
+  .badge{font-size:12px; color:var(--t2); background:var(--card); border:1px solid var(--line); border-radius:999px; padding:4px 12px}
+  .grid{display:grid; gap:14px}
+  .k4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+  .k2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:18px 20px}
+  .kpi{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px}
+  .kpi .lb{font-size:12.5px; color:var(--t2)}
+  .kpi .val{font-size:26px; font-weight:600; letter-spacing:-.4px; margin-top:2px; font-variant-numeric:tabular-nums}
+  .kpi .ft{font-size:12px; color:var(--t3); margin-top:2px}
+  .h2{font-size:14.5px; font-weight:600; margin:0 0 2px}
+  .h2sub{font-size:12.5px; color:var(--t3); margin:0 0 14px}
+  .toolbar{display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:12px}
+  .seg{display:inline-flex; background:var(--soft); border-radius:8px; padding:2px}
+  .seg button{
+    border:0; background:transparent; font:inherit; font-size:12.5px; color:var(--t2);
+    padding:5px 13px; border-radius:6px; cursor:pointer;
+  }
+  .seg button.active{background:var(--card); color:var(--t1); font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.06)}
+  .chip{
+    border:1px solid var(--line); background:var(--card); font:inherit; font-size:12.5px; color:var(--t2);
+    padding:5px 12px; border-radius:999px; cursor:pointer;
+  }
+  .chip.active{background:#EAF1FA; border-color:#B5D4F4; color:var(--blue); font-weight:600}
+  .ctl{display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px}
+  .row{display:flex; align-items:center; gap:12px}
+  .row label{font-size:12.5px; color:var(--t2); width:52px; flex:none}
+  .row input[type=range]{flex:1; accent-color:var(--blue)}
+  .row .v{font-size:13px; width:56px; text-align:right; font-variant-numeric:tabular-nums; font-weight:600}
+  .stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(112px,1fr)); gap:14px 10px}
+  .stat .lb{font-size:12px; color:var(--t2)}
+  .stat .val{font-size:16px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:1px}
+  .foot-note{font-size:12px; color:var(--t3); margin-top:14px; padding-top:12px; border-top:1px solid var(--line)}
+  .chart{width:100%}
+  #mainChart{height:400px}
+  #navChart{height:300px}
+  table{width:100%; border-collapse:collapse; font-size:13px}
+  th{text-align:left; font-weight:500; font-size:12px; color:var(--t3); padding:0 10px 8px; border-bottom:1px solid var(--line)}
+  td{padding:8px 10px; border-bottom:1px solid #F3F2EE; font-variant-numeric:tabular-nums}
+  th.num, td.num{text-align:right}
+  td.win{color:var(--green); font-weight:600}
+  td.lose{color:var(--orange)}
+  td.empty{text-align:center; color:var(--t3); padding:24px}
+  .tbl-wrap{max-height:340px; overflow:auto}
+  .tag{font-size:11.5px; padding:1px 8px; border-radius:999px; background:#EAF1FA; color:var(--blue)}
+  .tt-date{font-size:12px; color:var(--t3); margin-bottom:2px}
+  .tt-row{font-size:12.5px; line-height:1.7}
+  .tt-dot{display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px}
+  footer{margin-top:30px; font-size:12px; color:var(--t3); line-height:1.9}
+  footer b{color:var(--t2); font-weight:600}
+  #loading{padding:60px 0; text-align:center; color:var(--t3)}
+  .err{color:var(--orange); font-size:14px}
+  .err-sub{font-size:12.5px; color:var(--t3); line-height:1.9}
+  code{background:var(--soft); padding:1px 6px; border-radius:4px; font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>中证红利 · 40日收益差择时看板</h1>
+      <div class="sub" id="span">加载中…</div>
+    </div>
+    <div class="badge">数据更新于 <span id="updated">—</span></div>
+  </header>
+
+  <div id="loading">正在加载行情数据…</div>
+
+  <div class="grid k4" style="margin-bottom:14px">
+    <div class="kpi">
+      <div class="lb">当前 40日收益差</div>
+      <div class="val" id="kpiSpread">—</div>
+      <div class="ft" id="kpiDate">—</div>
+    </div>
+    <div class="kpi">
+      <div class="lb">当前信号</div>
+      <div class="val" id="kpiSignal">—</div>
+      <div class="ft" id="kpiSignalSub">—</div>
+    </div>
+    <div class="kpi">
+      <div class="lb">已持有</div>
+      <div class="val" id="kpiHeld">—</div>
+      <div class="ft" id="kpiHeldSub">—</div>
+    </div>
+    <div class="kpi">
+      <div class="lb">历史分位</div>
+      <div class="val" id="kpiPct">—</div>
+      <div class="ft" id="kpiPctSub">—</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="toolbar">
+      <div>
+        <div class="h2">40日收益差 · 中证红利全收益 − 市场</div>
+        <div class="h2sub"><span id="divCode">—</span> 相对 <span id="mktCode">—</span>（均含分红再投）</div>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+        <div class="seg">
+          <button data-mode="wind" class="active">Wind 原口径</button>
+          <button data-mode="proxy">中证全指代理</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart" id="mainChart"></div>
+    <div class="foot-note">
+      阴影区 = 持有区间 · 蓝点 = 跌破买入线 · 橙点 = 涨破卖出线 · 拖动下方滑块缩放时间轴
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="h2">参数</div>
+    <div class="h2sub">T 日收盘观察信号，T+1 日收盘执行；持仓期间吃中证红利全收益指数日收益</div>
+    <div class="ctl" style="margin-bottom:16px">
+      <div class="row">
+        <label>买入线</label>
+        <input type="range" id="buySlider" min="-8" max="0" step="0.5" value="-1">
+        <span class="v" id="buyVal">−1.0%</span>
+      </div>
+      <div class="row">
+        <label>卖出线</label>
+        <input type="range" id="sellSlider" min="1" max="15" step="0.5" value="5">
+        <span class="v" id="sellVal">+5.0%</span>
+      </div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap">
+      <button class="chip" data-preset="1" data-buy="-1" data-sell="5">大白优化版 −1% / +5%</button>
+      <button class="chip" data-preset="1" data-buy="-5" data-sell="10">张老师原版 −5% / +10%</button>
+      <button class="chip" data-preset="1" data-buy="-2" data-sell="3">窄格版 −2% / +3%</button>
+      <button class="chip" data-preset="1" data-buy="-1" data-sell="8">宽卖版 −1% / +8%</button>
+    </div>
+  </div>
+
+  <div class="grid k2" style="margin-bottom:14px">
+    <div class="card">
+      <div class="h2">策略表现</div>
+      <div class="h2sub">全区间 · 按上述参数实时重算</div>
+      <div class="stats">
+        <div class="stat"><div class="lb">累计收益</div><div class="val" id="statTotal">—</div></div>
+        <div class="stat"><div class="lb">年化收益</div><div class="val" id="statAnnual">—</div></div>
+        <div class="stat"><div class="lb">年化超额</div><div class="val" id="statExcess">—</div></div>
+        <div class="stat"><div class="lb">最大回撤</div><div class="val" id="statMDD">—</div></div>
+        <div class="stat"><div class="lb">交易次数</div><div class="val" id="statTrades">—</div></div>
+        <div class="stat"><div class="lb">胜率</div><div class="val" id="statWin">—</div></div>
+        <div class="stat"><div class="lb">盈亏比</div><div class="val" id="statPL">—</div></div>
+        <div class="stat"><div class="lb">持仓占比</div><div class="val" id="statHold">—</div></div>
+        <div class="stat"><div class="lb">平均持仓</div><div class="val" id="statAvgHold">—</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="h2">买入持有基准</div>
+      <div class="h2sub">始终满仓中证红利全收益指数</div>
+      <div class="stats">
+        <div class="stat"><div class="lb">累计收益</div><div class="val" id="bhTotal">—</div></div>
+        <div class="stat"><div class="lb">年化收益</div><div class="val" id="bhAnnual">—</div></div>
+        <div class="stat"><div class="lb">最大回撤</div><div class="val" id="bhMDD">—</div></div>
+      </div>
+      <div class="foot-note">年化超额 = 策略年化 − 买入持有年化</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="h2">净值对比</div>
+    <div class="h2sub">对数坐标 · 起始净值 1.0</div>
+    <div class="chart" id="navChart"></div>
+  </div>
+
+  <div class="card">
+    <div class="toolbar" style="margin-bottom:8px">
+      <div class="h2" style="margin:0">交易明细 · 共 <span id="tradeCount">0</span> 笔</div>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>买入日</th><th>卖出日</th><th class="num">持有交易日</th><th class="num">区间收益</th><th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="tradeBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer>
+    <div><b>数据来源</b>：Wind 万得金融数据服务（<code>index_data.get_index_kline</code>）· 中证红利全收益 <code>H00922.CSI</code> · 万得全A <code>881001.WI</code>（Wind 口径为全收益指数）· 代理口径 <code>H00985.CSI</code> 中证全指全收益。数据来源于万得 Wind 金融数据服务。</div>
+    <div><b>口径说明</b>：40 日收益差 = 中证红利全收益 40 日收益率 − 市场指数 40 日收益率，逐日滚动。窗口 40 个交易日取自原策略设定。</div>
+    <div><b>回测假设</b>：T 日收盘观察信号、T+1 日收盘执行；不计交易成本与冲击成本；持仓期间按指数全收益计算，未考虑 ETF 跟踪误差与管理费。</div>
+    <div style="margin-top:10px"><b>免责声明</b>：以上内容基于公开数据和量化分析，仅供参考，不构成投资建议。市场有风险，投资需谨慎。任何投资决策应结合个人风险承受能力、资金状况和投资目标独立判断，必要时咨询持牌专业机构。过往表现不预示未来收益。</div>
+  </footer>
+</div>
+
+<!-- 内联数据：双击本文件（file://）时也能源源不断供数，不依赖 HTTP 服务 -->
+<script src="data/data.js?v=1"></script>
+<script src="app.js?v=2"></script>
+</body>
+</html>
