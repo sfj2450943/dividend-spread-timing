@@ -6,13 +6,26 @@
   var DATA = null;
   var state = {
     mode: 'wind',          // 'wind' | 'proxy'
+    engine: 'simple',      // 'simple'（单买卖线）| 'combo'（年线分档）
     buyTh: -1.0,
     sellTh: 5.0,
     maWin: 242,            // 收益差年线窗口（交易日）
     showMA: true,          // 主图是否叠加年线
     ma: null,              // 年线序列
+    cross: null,           // { up:[], down:[] }
     crossMap: null,        // 索引 → 'up' | 'down'
     raw: null,             // 当前回测结果
+    bh: null,              // 买入持有基准
+    ref: null,             // 组合版下的「简单版 −1%/+5%」对照
+    combo: {               // 组合版参数（年线分档）
+      buy: -1.0,           // 两档共用买入线
+      sellUp: 8.0,         // 年线 > 0 时的卖出线
+      sellDown: 5.0,       // 年线 < 0 时的卖出线
+      capLo: 0.5,          // 年线 < 0 时的仓位上限
+      addUp: 0.0,          // 年线 > 0 时的加仓幅度（0 = 不加杠杆）
+      finRate: 6.0,        // 融资年化成本 %（仅 addUp > 0 生效）
+      costBps: 0           // 单边交易成本 bps
+    },
     charts: {}
   };
 
@@ -39,6 +52,51 @@
   function fmtDate(s) {
     if (!s || s.length !== 8) return s || '—';
     return s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8);
+  }
+
+  /* ───────── 通用统计工具 ───────── */
+
+  function mean(a) {
+    if (!a.length) return 0;
+    return a.reduce(function (x, y) { return x + y; }, 0) / a.length;
+  }
+
+  function stdev(a) {
+    if (a.length < 2) return 0;
+    var m = mean(a);
+    return Math.sqrt(a.reduce(function (s, v) { return s + (v - m) * (v - m); }, 0) / (a.length - 1));
+  }
+
+  function maxDrawdown(nav) {
+    var peak = nav[0], mdd = 0;
+    for (var i = 0; i < nav.length; i++) {
+      if (nav[i] > peak) peak = nav[i];
+      var dd = nav[i] / peak - 1;
+      if (dd < mdd) mdd = dd;
+    }
+    return mdd;
+  }
+
+  // 由净值序列 + 仓位序列导出波动率 / Sharpe / 平均仓位 / 换手倍数
+  // start：统计起点下标（组合版从「年线首个可用日」起算，跳过空仓等待期）
+  function weightStats(nav, w, start) {
+    var s0 = start || 0;
+    var rets = [], turn = 0, i;
+    for (i = s0 + 1; i < nav.length; i++) rets.push(nav[i] / nav[i - 1] - 1);
+    for (i = s0 + 1; i < w.length; i++) turn += Math.abs(w[i] - w[i - 1]);
+    var sd = stdev(rets);
+    return {
+      vol: sd * Math.sqrt(252) * 100,
+      sharpe: sd > 0 ? mean(rets) / sd * Math.sqrt(252) : null,
+      avgWeight: mean(w.slice(s0)) * 100,
+      turnover: turn / 2
+    };
+  }
+
+  // 年线首个可用下标（组合版的策略启动日）
+  function firstMaIdx(ma) {
+    for (var i = 0; i < ma.length; i++) { if (isValid(ma[i])) return i; }
+    return 0;
   }
 
   /* ───────── 回测（与 scripts/fetch_data.py 保持同一逻辑） ───────── */
@@ -107,10 +165,12 @@
     }
 
     var holdDays = pos.reduce(function (a, p) { return a + p; }, 0);
+    var ws = weightStats(nav, pos);
 
     return {
       nav: nav,
       pos: pos,
+      w: pos.slice(),
       trades: trades,
       stats: {
         totalReturn: (nav[n - 1] - 1) * 100,
@@ -123,28 +183,30 @@
         avgLoss: -avgLoss,
         avgHoldDays: closed.length ? Math.round(closed.reduce(function (a, t) { return a + t.days; }, 0) / closed.length) : 0,
         holdRatio: holdDays / n * 100,
+        vol: ws.vol,
+        sharpe: ws.sharpe,
+        avgWeight: ws.avgWeight,
+        turnover: ws.turnover,
         openPosition: !!(trades.length && trades[trades.length - 1].open)
       }
     };
   }
 
-  function buyAndHold(divNav) {
+  // 买入持有基准；start 指定统计起点（组合版与策略同区间，便于直接比较）
+  function buyAndHold(divNav, start) {
     var n = divNav.length;
+    var s0 = start || 0;
     var nav = new Array(n);
     var base = divNav[0];
     for (var i = 0; i < n; i++) nav[i] = divNav[i] / base;
-    var peak = nav[0], mdd = 0;
-    for (i = 0; i < n; i++) {
-      if (nav[i] > peak) peak = nav[i];
-      var dd = nav[i] / peak - 1;
-      if (dd < mdd) mdd = dd;
-    }
-    var years = (n - 1) / 252;
+    var years = (n - 1 - s0) / 252;
+    var mult = years > 0 ? nav[n - 1] / nav[s0] : 1;
     return {
       nav: nav,
-      totalReturn: (nav[n - 1] - 1) * 100,
-      annualReturn: (Math.pow(nav[n - 1], 1 / years) - 1) * 100,
-      maxDrawdown: mdd * 100
+      startIdx: s0,
+      totalReturn: (mult - 1) * 100,
+      annualReturn: (Math.pow(mult, 1 / years) - 1) * 100,
+      maxDrawdown: maxDrawdown(nav.slice(s0)) * 100
     };
   }
 
@@ -203,7 +265,197 @@
     return null;
   }
 
+  /* ───────── 组合版：年线分档（分层卖出线 + 弱市封顶 + 强市加仓） ───────── */
+
+  /*
+   * 规则（与 combo_report.py / combo_default_check.py 的 build_combo 一致）
+   *   年线 ≥ 0（强市）：卖出线 = sellUp（默认 +8%）　仓位上限 100%　可加仓 addUp
+   *   年线 < 0（弱市）：卖出线 = sellDown（默认 +5%）　仓位上限 capLo（默认 50%）
+   *   目标仓位 w = min(tgt, 上限) × 加仓系数，tgt ∈ {0,1} 由分层买卖线给出的持有状态
+   *   口径同简单版：第 i 日仓位由第 i-1 日的收益差与年线决定（0 日延迟）
+   */
+  function comboWeights(spread, ma, cfg) {
+    var n = spread.length;
+    var w = new Array(n), tgt = new Array(n);
+    w[0] = 0; tgt[0] = 0;
+    for (var i = 1; i < n; i++) {
+      var sig = spread[i - 1];
+      var m = isValid(ma[i - 1]) ? ma[i - 1] : null;
+      if (!isValid(sig) || m === null) {
+        tgt[i] = tgt[i - 1];
+      } else {
+        var up = m >= 0;
+        var sell = up ? cfg.sellUp : cfg.sellDown;
+        if (tgt[i - 1] === 0 && sig < cfg.buy) tgt[i] = 1;
+        else if (tgt[i - 1] === 1 && sig > sell) tgt[i] = 0;
+        else tgt[i] = tgt[i - 1];
+      }
+      var strong = (m !== null && m >= 0);
+      var cap = strong ? 1 : cfg.capLo;
+      var add = strong ? (1 + cfg.addUp) : 1;
+      w[i] = Math.min(tgt[i], cap) * add;
+    }
+    return { w: w, tgt: tgt };
+  }
+
+  // 每日净收益因子：w 倍标的收益 − 调仓单边成本 − 融资利息（仅对超出 100% 的部分计息）
+  function comboDailyFactor(divNav, w, cfg, i) {
+    var r = divNav[i] / divNav[i - 1] - 1;
+    var cost = Math.abs(w[i] - w[i - 1]) * cfg.costBps / 10000;
+    var fin = w[i] > 1 ? (w[i] - 1) * cfg.finRate / 100 / 252 : 0;
+    return 1 + w[i] * r - cost - fin;
+  }
+
+  function comboNav(divNav, w, cfg) {
+    var n = divNav.length;
+    var nav = new Array(n);
+    nav[0] = 1;
+    for (var i = 1; i < n; i++) nav[i] = nav[i - 1] * comboDailyFactor(divNav, w, cfg, i);
+    return nav;
+  }
+
+  /*
+   * 按「仓位档位」切段：每段内仓位恒定。
+   * 段收益 = Π(段内每日净收益因子) − 1，各段连乘恒等于累计收益（自洽校验口径）。
+   */
+  function comboSegments(divNav, w, cfg) {
+    var n = w.length;
+    if (n < 2) return [];
+    var bounds = [], s = 1;
+    for (var i = 2; i <= n; i++) {
+      if (i === n || Math.abs(w[i] - w[s]) > 1e-12) { bounds.push([s, i - 1]); s = i; }
+    }
+    var out = [];
+    for (var k = 0; k < bounds.length; k++) {
+      var from = bounds[k][0], to = bounds[k][1];
+      var acc = 1;
+      for (var j = from; j <= to; j++) acc *= comboDailyFactor(divNav, w, cfg, j);
+      var wv = w[from];
+      var adj = k > 0 && bounds[k - 1][1] === from - 1;   // 前一段是否紧邻（决定「建仓 / 加仓」）
+      var prevW = adj ? w[bounds[k - 1][0]] : 0;
+      out.push({
+        buy: from - 1,
+        sell: to,
+        days: to - from + 1,
+        ret: (acc - 1) * 100,
+        w: wv,
+        prevW: prevW,
+        act: wv === 0 ? '清仓' : (prevW === 0 ? '建仓' : (wv > prevW + 1e-12 ? '加仓' : '减仓')),
+        open: (to === n - 1) && wv > 0,
+        flat: wv === 0
+      });
+    }
+    return out;
+  }
+
+  function comboBacktest(divNav, spread, ma, cfg, start) {
+    var n = divNav.length;
+    var s0 = start || 0;
+    var w = comboWeights(spread, ma, cfg).w;
+    var nav = comboNav(divNav, w, cfg);
+    var segs = comboSegments(divNav, w, cfg);
+    var traded = segs.filter(function (x) { return !x.flat; });
+    var closed = traded.filter(function (x) { return !x.open; });
+    var wins = closed.filter(function (x) { return x.ret > 0; });
+    var losses = closed.filter(function (x) { return x.ret <= 0; });
+    var avgWin = wins.length ? mean(wins.map(function (x) { return x.ret; })) : 0;
+    var avgLoss = losses.length ? Math.abs(mean(losses.map(function (x) { return x.ret; }))) : 0;
+    var holdDays = w.reduce(function (a, x) { return a + (x > 0 ? 1 : 0); }, 0);
+    var years = (n - 1 - s0) / 252;
+    var ws = weightStats(nav, w, s0);
+
+    return {
+      nav: nav,
+      w: w,
+      startIdx: s0,
+      pos: w.map(function (x) { return x > 0 ? 1 : 0; }),
+      trades: traded,
+      stats: {
+        totalReturn: (nav[n - 1] - 1) * 100,
+        annualReturn: (Math.pow(nav[n - 1], 1 / years) - 1) * 100,
+        maxDrawdown: maxDrawdown(nav.slice(s0)) * 100,
+        tradeCount: traded.length,
+        winRate: closed.length ? wins.length / closed.length * 100 : 0,
+        plRatio: avgLoss > 0 ? avgWin / avgLoss : null,
+        avgWin: avgWin,
+        avgLoss: -avgLoss,
+        avgHoldDays: traded.length ? Math.round(mean(traded.map(function (x) { return x.days; }))) : 0,
+        holdRatio: holdDays / (n - s0) * 100,
+        vol: ws.vol,
+        sharpe: ws.sharpe,
+        avgWeight: ws.avgWeight,
+        turnover: ws.turnover,
+        openPosition: !!(traded.length && traded[traded.length - 1].open)
+      }
+    };
+  }
+
+  // 用最新一根收盘信号推出的「下一交易日应持有的仓位」（0 日延迟：当日收盘执行）
+  function comboNextTarget() {
+    var cfg = state.combo;
+    var sp = spreadArray();
+    var last = sp.length - 1;
+    var sig = sp[last];
+    var m = isValid(state.ma[last]) ? state.ma[last] : null;
+    var strong = (m !== null && m >= 0);
+    var cap = strong ? 1 : cfg.capLo;
+    var add = strong ? (1 + cfg.addUp) : 1;
+    var holding = state.raw.w[last] > 0;
+    var hold;
+    if (!isValid(sig) || m === null) hold = holding;
+    else if (!holding) hold = sig < cfg.buy;
+    else hold = !(sig > (strong ? cfg.sellUp : cfg.sellDown));
+    return { tgt: hold ? Math.min(1, cap) * add : 0, hold: hold, strong: strong, ma: m, sig: sig };
+  }
+
   /* ───────── 渲染 ───────── */
+
+  // 当前应执行的动作（两套引擎共用）
+  function signalOf() {
+    var sp = spreadArray();
+    var sig = sp[sp.length - 1];
+
+    if (state.engine === 'combo') {
+      var cfg = state.combo;
+      var nt = comboNextTarget();
+      var curW = state.raw.w[sp.length - 1];
+      var pctT = (nt.tgt * 100).toFixed(0);
+      var side = nt.ma === null ? '年线数据不足' : (nt.strong ? '年线在 0 轴上方' : '年线在 0 轴下方');
+      var sellTh = nt.strong ? cfg.sellUp : cfg.sellDown;
+      if (curW === 0) {
+        if (nt.hold && nt.tgt > 0) {
+          return { text: '买入 ' + pctT + '%', sub: side + ' → 建仓 ' + pctT + '%', dir: 'buy' };
+        }
+        return {
+          text: '空仓等待',
+          sub: nt.strong ? '等收益差跌破 ' + fmtPct(cfg.buy, 1)
+                         : '弱市上限 ' + (cfg.capLo * 100).toFixed(0) + '%，暂不参与',
+          dir: 'idle'
+        };
+      }
+      if (!nt.hold) {
+        return { text: '清仓', sub: '涨破' + (nt.strong ? '强市' : '弱市') + '卖出线 ' + fmtPct(sellTh, 1), dir: 'sell' };
+      }
+      if (Math.abs(nt.tgt - curW) > 1e-9) {
+        var up2 = nt.tgt > curW;
+        return {
+          text: (up2 ? '加仓至 ' : '减仓至 ') + pctT + '%',
+          sub: '年线档位切换 → 目标 ' + pctT + '%',
+          dir: up2 ? 'buy' : 'sell'
+        };
+      }
+      return {
+        text: '继续持有',
+        sub: '仓位 ' + (curW * 100).toFixed(0) + '%，未达卖出线 ' + fmtPct(sellTh, 1),
+        dir: 'hold'
+      };
+    }
+
+    if (sig < state.buyTh) return { text: '买入', sub: '跌破买入线 ' + fmtPct(state.buyTh, 1), dir: 'buy' };
+    if (sig > state.sellTh) return { text: '卖出', sub: '涨破卖出线 ' + fmtPct(state.sellTh, 1), dir: 'sell' };
+    if (state.raw.stats.openPosition) return { text: '持有', sub: '未达卖出线', dir: 'hold' };
+    return { text: '空仓', sub: '等待跌破买入线', dir: 'idle' };
+  }
 
   function renderKPI() {
     var s = spreadArray();
@@ -215,25 +467,40 @@
 
     $('kpiDate').textContent = fmtDate(dates[last]);
     $('kpiSpread').textContent = fmtPct(cur, 2);
-    $('kpiSpread').style.color = cur < state.buyTh ? COLOR.buy : (cur > state.sellTh ? COLOR.sell : 'inherit');
+    var lowTh = state.engine === 'combo' ? state.combo.buy : state.buyTh;
+    var highTh = state.engine === 'combo'
+      ? (state.combo.sellDown)
+      : state.sellTh;
+    $('kpiSpread').style.color = cur < lowTh ? COLOR.buy : (cur > highTh ? COLOR.sell : 'inherit');
 
-    var sigText, sigSub;
-    if (cur < state.buyTh) { sigText = '买入'; sigSub = '跌破买入线 ' + fmtPct(state.buyTh, 1); }
-    else if (cur > state.sellTh) { sigText = '卖出'; sigSub = '涨破卖出线 ' + fmtPct(state.sellTh, 1); }
-    else if (st.openPosition) { sigText = '持有'; sigSub = '未达卖出线'; }
-    else { sigText = '空仓'; sigSub = '等待跌破买入线'; }
-    $('kpiSignal').textContent = sigText;
-    $('kpiSignal').style.color = sigText === '买入' ? COLOR.buy : (sigText === '卖出' ? COLOR.sell : 'inherit');
-    $('kpiSignalSub').textContent = sigSub;
+    var sg = signalOf();
+    $('kpiSignal').textContent = sg.text;
+    $('kpiSignal').style.color = sg.dir === 'buy' ? COLOR.buy : (sg.dir === 'sell' ? COLOR.sell : 'inherit');
+    $('kpiSignalSub').textContent = sg.sub;
 
     var heldTxt, heldSub;
-    if (st.openPosition) {
-      var t = st.trades[st.trades.length - 1];
-      heldTxt = (dates.length - 1 - t.buy) + ' 天';
-      heldSub = '自 ' + fmtDate(dates[t.buy]) + ' 起持有';
+    if (state.engine === 'combo') {
+      $('kpiHeldLb').textContent = '当前仓位';
+      var curW = r.w[dates.length - 1];
+      heldTxt = (curW * 100).toFixed(0) + '%';
+      if (curW > 0) {
+        heldSub = '最近一次调仓 ' + fmtDate(dates[st.trades[st.trades.length - 1].buy]);
+      } else {
+        var nt2 = comboNextTarget();
+        heldSub = (nt2.hold && nt2.tgt > 0)
+          ? '最新信号建议建仓 ' + (nt2.tgt * 100).toFixed(0) + '%'
+          : '空仓中 · 等收益差跌破 ' + fmtPct(state.combo.buy, 1);
+      }
     } else {
-      heldTxt = '0 天';
-      heldSub = '空仓中';
+      $('kpiHeldLb').textContent = '已持有';
+      if (st.openPosition) {
+        var t = st.trades[st.trades.length - 1];
+        heldTxt = (dates.length - 1 - t.buy) + ' 天';
+        heldSub = '自 ' + fmtDate(dates[t.buy]) + ' 起持有';
+      } else {
+        heldTxt = '0 天';
+        heldSub = '空仓中';
+      }
     }
     $('kpiHeld').textContent = heldTxt;
     $('kpiHeldSub').textContent = heldSub;
@@ -257,6 +524,23 @@
   function renderStats() {
     var st = state.raw.stats;
     var bh = state.bh;
+    var isCombo = state.engine === 'combo';
+
+    $('perfTitle').textContent = isCombo ? '组合方案表现' : '策略表现';
+    $('perfSub').textContent = isCombo
+      ? '自 ' + fmtDate(DATA.series.dates[state.raw.startIdx]) + ' 起（年线可用日）· 含调仓成本' +
+        (state.combo.addUp > 0 ? '与 ' + state.combo.finRate + '% 融资成本' : '（不含融资）')
+      : '全区间 · 按上述参数实时重算';
+    $('statTradesLb').textContent = isCombo ? '调仓段数' : '交易次数';
+
+    if (isCombo) {
+      $('bhTitle').textContent = '买入持有基准 · 同区间';
+      $('bhSub').textContent = '自 ' + fmtDate(DATA.series.dates[state.bh.startIdx]) + ' 起始终满仓中证红利全收益指数';
+    } else {
+      $('bhTitle').textContent = '买入持有基准';
+      $('bhSub').textContent = '始终满仓中证红利全收益指数';
+    }
+
     $('statTotal').textContent = fmtPct(st.totalReturn, 1);
     $('statAnnual').textContent = fmtPct(st.annualReturn, 2);
     $('statExcess').textContent = fmtPct(st.annualReturn - bh.annualReturn, 2);
@@ -266,6 +550,12 @@
     $('statPL').textContent = st.plRatio === null ? '—' : st.plRatio.toFixed(2);
     $('statHold').textContent = st.holdRatio.toFixed(0) + '%';
     $('statAvgHold').textContent = st.avgHoldDays ? st.avgHoldDays + ' 天' : '—';
+    $('statVol').textContent = st.vol === null ? '—' : st.vol.toFixed(2) + '%';
+    $('statSharpe').textContent = st.sharpe === null ? '—' : st.sharpe.toFixed(2);
+    $('statAvgW').textContent = st.avgWeight.toFixed(1) + '%';
+    $('statTurn').textContent = st.turnover.toFixed(2);
+    $('statMDD').style.color = st.maxDrawdown < -30 ? COLOR.sell : 'inherit';
+    $('statAvgW').style.color = st.avgWeight > 100.5 ? COLOR.sell : 'inherit';
 
     $('bhTotal').textContent = fmtPct(bh.totalReturn, 1);
     $('bhAnnual').textContent = fmtPct(bh.annualReturn, 2);
@@ -274,10 +564,28 @@
 
   function renderTrades() {
     var dates = DATA.series.dates;
+    var isCombo = state.engine === 'combo';
     var rows = state.raw.trades.slice().reverse();
+
+    $('tradeHead').innerHTML = isCombo
+      ? '<th>调仓日</th><th>操作</th><th class="num">目标仓位</th><th>结束日</th>' +
+        '<th class="num">段内交易日</th><th class="num">区间收益</th>'
+      : '<th>买入日</th><th>卖出日</th><th class="num">持有交易日</th>' +
+        '<th class="num">区间收益</th><th>状态</th>';
+
     var html = rows.map(function (t) {
-      var cls = t.open ? 'open' : (t.ret > 0 ? 'win' : 'lose');
-      var tag = t.open ? '<span class="tag tag-open">持有中</span>' : '';
+      var cls = t.ret > 0 ? 'win' : 'lose';
+      if (isCombo) {
+        return '<tr>' +
+          '<td>' + fmtDate(dates[t.buy]) + '</td>' +
+          '<td>' + t.act + '</td>' +
+          '<td class="num">' + (t.w * 100).toFixed(0) + '%</td>' +
+          '<td>' + (t.open ? '持有中' : fmtDate(dates[t.sell])) + '</td>' +
+          '<td class="num">' + t.days + '</td>' +
+          '<td class="num ' + cls + '">' + fmtPct(t.ret, 2) + '</td>' +
+          '</tr>';
+      }
+      var tag = t.open ? '<span class="tag">持有中</span>' : '';
       return '<tr>' +
         '<td>' + fmtDate(dates[t.buy]) + '</td>' +
         '<td>' + (t.open ? '—' : fmtDate(dates[t.sell])) + '</td>' +
@@ -286,8 +594,17 @@
         '<td>' + tag + '</td>' +
         '</tr>';
     }).join('');
-    $('tradeBody').innerHTML = html || '<tr><td colspan="5" class="empty">当前参数下无成交</td></tr>';
+
+    $('tradeBody').innerHTML = html ||
+      '<tr><td colspan="' + (isCombo ? 6 : 5) + '" class="empty">当前参数下无成交</td></tr>';
     $('tradeCount').textContent = state.raw.trades.length;
+    $('tradeTitle').textContent = isCombo ? '调仓明细' : '交易明细';
+    $('tradeNote').innerHTML = isCombo
+      ? '调仓日 = 信号触发日、按该日收盘价成交（0 日延迟）· 目标仓位 = 调仓后应持有的仓位比例 · ' +
+        '「段内交易日」为该仓位维持的交易日数 · 段收益按逐日净值因子累乘（含调仓成本' +
+        (state.combo.addUp > 0 ? '与融资利息' : '') + '），各段收益连乘 = 累计收益'
+      : '买卖日 = 信号触发日、按该日收盘价成交（0 日延迟）· 区间收益 = 卖出日收盘净值 ÷ 买入日收盘净值 − 1 · ' +
+        '逐笔区间收益连乘 = 上述「累计收益」（持有中一笔按最新净值折算，仅四舍五入误差 &lt;0.1pct）';
   }
 
   function holdingRanges() {
@@ -307,13 +624,42 @@
     var dates = DATA.series.dates;
     var s = spreadArray();
     var labels = dates.map(fmtDate);
+    var isCombo = state.engine === 'combo';
+
+    // 阈值：组合版有两条卖出线（强市放宽 / 弱市收紧）
+    var buyLine = isCombo ? state.combo.buy : state.buyTh;
+    var sellLines = isCombo
+      ? [{ v: state.combo.sellUp, t: '卖出线·强市 ' + fmtPct(state.combo.sellUp, 1), c: COLOR.sell },
+         { v: state.combo.sellDown, t: '卖出线·弱市 ' + fmtPct(state.combo.sellDown, 1), c: '#E89B7E' }]
+      : [{ v: state.sellTh, t: '卖出线 ' + fmtPct(state.sellTh, 1), c: COLOR.sell }];
+    var sellLo = Math.min.apply(null, sellLines.map(function (x) { return x.v; }));
 
     var buyPts = [], sellPts = [];
     for (var i = 0; i < s.length; i++) {
       if (s[i] === null) continue;
-      if (s[i] < state.buyTh) buyPts.push([i, s[i]]);
-      if (s[i] > state.sellTh) sellPts.push([i, s[i]]);
+      if (s[i] < buyLine) buyPts.push([i, s[i]]);
+      if (s[i] > sellLo) sellPts.push([i, s[i]]);
     }
+
+    // 标签左右分置：卖出线靠右、中轴与买入线靠左，避免数值接近时文字重叠
+    var mkData = sellLines.map(function (x, idx) {
+      return {
+        yAxis: x.v,
+        lineStyle: { color: x.c, type: 'dashed', width: 1 },
+        label: {
+          formatter: x.t, color: x.c,
+          position: (sellLines.length > 1 && idx > 0) ? 'insideEndBottom' : 'insideEndTop'
+        }
+      };
+    });
+    mkData.push({
+      yAxis: 0, lineStyle: { color: COLOR.zero, type: 'dashed', width: 1 },
+      label: { formatter: '中轴 0%', color: '#888780', position: 'insideStartTop' }
+    });
+    mkData.push({
+      yAxis: buyLine, lineStyle: { color: COLOR.buy, type: 'dashed', width: 1 },
+      label: { formatter: '买入线 ' + fmtPct(buyLine, 1), color: COLOR.buy, position: 'insideStartBottom' }
+    });
 
     var startPct = s.length > 1200 ? Math.round((1 - 750 / s.length) * 100) : 0;
 
@@ -347,11 +693,13 @@
               (dir === 'up' ? COLOR.crossUp : COLOR.crossDown) + '"></span>年线 <b>' +
               (dir === 'up' ? '上穿' : '下穿') + ' 0 轴</b></div>';
           }
-          if (state.raw && state.raw.pos) {
-            var held = state.raw.pos[di] === 1;
+          if (state.raw && state.raw.w) {
+            var wv = state.raw.w[di];
             row += '<div class="tt-row"><span class="tt-dot" style="background:' +
-              (held ? COLOR.strat : COLOR.zero) + '"></span>' +
-              '仓位 <b>' + (held ? '持有' : '空仓') + '</b></div>';
+              (wv > 0 ? COLOR.strat : COLOR.zero) + '"></span>' +
+              '仓位 <b>' + (state.engine === 'combo'
+                ? (wv * 100).toFixed(0) + '%'
+                : (wv > 0 ? '持有' : '空仓')) + '</b></div>';
           }
           return row;
         }
@@ -395,14 +743,7 @@
             silent: true,
             symbol: 'none',
             label: { position: 'insideEndTop', fontSize: 11 },
-            data: [
-              { yAxis: state.sellTh, lineStyle: { color: COLOR.sell, type: 'dashed', width: 1 },
-                label: { formatter: '卖出线 ' + fmtPct(state.sellTh, 1), color: COLOR.sell } },
-              { yAxis: 0, lineStyle: { color: COLOR.zero, type: 'dashed', width: 1 },
-                label: { formatter: '中轴 0%', color: '#888780' } },
-              { yAxis: state.buyTh, lineStyle: { color: COLOR.buy, type: 'dashed', width: 1 },
-                label: { formatter: '买入线 ' + fmtPct(state.buyTh, 1), color: COLOR.buy, position: 'insideEndBottom' } }
-            ]
+            data: mkData
           }
         },
         {
@@ -461,8 +802,24 @@
   function renderNavChart() {
     var dates = DATA.series.dates;
     var labels = dates.map(fmtDate);
+    var isCombo = state.engine === 'combo';
+    var stratName = isCombo ? '组合方案（当前参数）' : '择时策略';
     var nav = state.raw.nav;
     var bh = state.bh.nav;
+
+    var series = [
+      { name: stratName, type: 'line', data: nav, showSymbol: false,
+        lineStyle: { width: 1.7, color: COLOR.strat } }
+    ];
+    var legendData = [stratName];
+    if (isCombo && state.ref) {
+      series.push({ name: '简单版 −1%/+5%', type: 'line', data: state.ref.nav, showSymbol: false,
+        lineStyle: { width: 1.2, color: '#9DBBD8', type: 'dashed' } });
+      legendData.push('简单版 −1%/+5%');
+    }
+    series.push({ name: '买入持有', type: 'line', data: bh, showSymbol: false,
+      lineStyle: { width: 1.4, color: COLOR.hold } });
+    legendData.push('买入持有');
 
     var opt = {
       animation: false,
@@ -470,7 +827,7 @@
       legend: {
         top: 0, right: 0, itemWidth: 14, itemHeight: 2,
         textStyle: { color: '#5F5E5A', fontSize: 12 },
-        data: ['择时策略', '买入持有']
+        data: legendData
       },
       tooltip: {
         trigger: 'axis',
@@ -480,6 +837,11 @@
             row += '<div class="tt-row"><span class="tt-dot" style="background:' + p.color + '"></span>' +
               p.seriesName + ' <b>' + p.value.toFixed(2) + '</b></div>';
           });
+          var rg = state.raw.w ? state.raw.w[ps[0].dataIndex] : null;
+          if (rg !== null && rg !== undefined) {
+            row += '<div class="tt-row"><span class="tt-dot" style="background:' + COLOR.zero + '"></span>' +
+              '仓位 <b>' + (isCombo ? (rg * 100).toFixed(0) + '%' : (rg > 0 ? '持有' : '空仓')) + '</b></div>';
+          }
           return row;
         }
       },
@@ -497,19 +859,79 @@
         splitLine: { lineStyle: { color: '#EFEEE9' } }
       },
       dataZoom: [{ type: 'inside' }],
-      series: [
-        {
-          name: '择时策略', type: 'line', data: nav, showSymbol: false,
-          lineStyle: { width: 1.6, color: COLOR.strat }
-        },
-        {
-          name: '买入持有', type: 'line', data: bh, showSymbol: false,
-          lineStyle: { width: 1.4, color: COLOR.hold }
-        }
-      ]
+      series: series
     };
 
     state.charts.nav.setOption(opt, true);
+  }
+
+  // 组合版专属：今日操作建议
+  function renderAdvice() {
+    var card = $('adviceCard');
+    if (state.engine !== 'combo') { card.style.display = 'none'; return; }
+    card.style.display = '';
+
+    var dates = DATA.series.dates;
+    var last = dates.length - 1;
+    var cfg = state.combo;
+    var nt = comboNextTarget();
+    var sg = signalOf();
+    var curW = state.raw.w[last];
+    var pctT = (nt.tgt * 100).toFixed(0);
+    var sellNow = nt.strong ? cfg.sellUp : cfg.sellDown;
+
+    $('adviceDate').textContent = '数据截至 ' + fmtDate(dates[last]) +
+      ' 收盘 · 按该日收盘信号决策、该日收盘价成交（0 日延迟）';
+    $('adviceBadge').textContent = '组合版 · 年线分档' + (cfg.addUp > 0 ? ' · 含杠杆' : ' · 无杠杆');
+
+    $('adviceAct').textContent = sg.text;
+    $('adviceAct').style.color = sg.dir === 'buy' ? COLOR.buy : (sg.dir === 'sell' ? COLOR.sell : 'inherit');
+
+    var why;
+    if (curW === 0 && nt.hold && nt.tgt > 0) {
+      why = '收益差 ' + fmtPct(nt.sig, 2) + ' 已跌破买入线 ' + fmtPct(cfg.buy, 1) + '。' +
+        (nt.strong
+          ? '年线在 0 轴上方，红利相对走强，可建满仓' + (cfg.addUp > 0 ? '并按设定加仓至 ' + pctT + '%' : '') + '。'
+          : '但年线在 0 轴下方，红利相对走弱，只建 ' + pctT + '% 的防守仓位。');
+    } else if (curW === 0) {
+      why = '收益差 ' + fmtPct(nt.sig, 2) + ' 尚未跌破买入线 ' + fmtPct(cfg.buy, 1) + '，继续等待。' +
+        '当前年线 ' + (nt.ma === null ? '数据不足' : (nt.strong ? '在 0 轴上方' : '在 0 轴下方') + '（' + fmtPct(nt.ma, 2) + '）。');
+    } else if (!nt.hold) {
+      why = '收益差 ' + fmtPct(nt.sig, 2) + ' 已涨破' + (nt.strong ? '强市' : '弱市') + '卖出线 ' +
+        fmtPct(sellNow, 1) + '，按规则清仓离场。';
+    } else if (Math.abs(nt.tgt - curW) > 1e-9) {
+      why = '年线由' + (nt.strong ? '负转正' : '正转负') + '，档位切换：卖出线改为 ' + fmtPct(sellNow, 1) +
+        '，仓位' + (nt.strong ? '可提到 100%' + (cfg.addUp > 0 ? '（加仓后 ' + pctT + '%）' : '') : '上限降到 ' + pctT + '%') + '。';
+    } else {
+      why = '收益差 ' + fmtPct(nt.sig, 2) + ' 位于买入线 ' + fmtPct(cfg.buy, 1) + ' 与' +
+        (nt.strong ? '强市' : '弱市') + '卖出线 ' + fmtPct(sellNow, 1) + ' 之间，维持当前仓位不动。';
+    }
+    $('adviceWhy').textContent = why;
+
+    $('advSig').textContent = fmtPct(nt.sig, 2);
+    $('advSig').style.color = nt.sig < cfg.buy ? COLOR.buy : (nt.sig > sellNow ? COLOR.sell : 'inherit');
+    $('advMA').textContent = nt.ma === null ? '—' : fmtPct(nt.ma, 2);
+    $('advMA').style.color = nt.ma === null ? 'inherit' : (nt.strong ? COLOR.crossUp : COLOR.crossDown);
+    $('advState').textContent = nt.ma === null ? '数据不足' : (nt.strong ? '0 轴上方' : '0 轴下方');
+    $('advState').style.color = nt.ma === null ? 'inherit' : (nt.strong ? COLOR.crossUp : COLOR.crossDown);
+    $('advCur').textContent = (curW * 100).toFixed(0) + '%';
+    var tgtShow = (sg.dir === 'sell') ? '0%' : pctT + '%';
+    $('advTgt').textContent = tgtShow;
+    $('advTgt').style.color = sg.dir === 'sell' ? COLOR.sell : (sg.dir === 'buy' ? COLOR.buy : 'inherit');
+
+    var msgs = [];
+    if (cfg.addUp > 0) {
+      var strongPct = ((1 + cfg.addUp) * 100).toFixed(0);
+      msgs.push('<b>已启用杠杆</b>：年线 0 轴上方时仓位 ' + strongPct + '%，超出 100% 的部分按年化 ' +
+        cfg.finRate + '% 计息。该配置历史最大回撤约 −32%，快速下跌时存在强制平仓风险。');
+    }
+    if (nt.ma !== null && !nt.strong) {
+      msgs.push('<b>年线在 0 轴下方</b>：历史统计中，年线 &lt; 0 期间红利的前瞻收益明显低于年线 &gt; 0 期间，' +
+        '本档位只做防守 —— 半仓 + 收紧卖出线，不做加仓。');
+    }
+    var warn = $('adviceWarn');
+    if (msgs.length) { warn.innerHTML = msgs.join('<br>'); warn.style.display = ''; }
+    else { warn.style.display = 'none'; }
   }
 
   function recompute() {
@@ -522,16 +944,84 @@
     state.ma = maArray(sp, state.maWin);
     state.cross = buildCross(state.ma);
     state.crossMap = state.cross.map;
-    state.raw = backtest(divNav, sp, state.buyTh, state.sellTh);
-    state.bh = buyAndHold(divNav);
+
+    // 组合版从「年线首个可用日」起算：此前 242 天无信号、策略处于空仓等待期
+    var s0 = state.engine === 'combo' ? firstMaIdx(state.ma) : 0;
+    state.bh = buyAndHold(divNav, s0);
+
+    if (state.engine === 'combo') {
+      state.raw = comboBacktest(divNav, sp, state.ma, state.combo, s0);
+      state.ref = backtest(divNav, sp, -1.0, 5.0);
+    } else {
+      state.raw = backtest(divNav, sp, state.buyTh, state.sellTh);
+      state.ref = null;
+    }
+
     renderKPI();
     renderStats();
     renderTrades();
+    renderAdvice();
     renderMainChart();
     renderNavChart();
   }
 
   /* ───────── 交互 ───────── */
+
+  /* ───────── 交互 ───────── */
+
+  var COMBO_PRESETS = {
+    P0: { buy: -1, sellUp: 5, sellDown: 5, capLo: 1.0, addUp: 0 },
+    P2: { buy: -1, sellUp: 8, sellDown: 5, capLo: 0.5, addUp: 0 },
+    P3: { buy: -1, sellUp: 8, sellDown: 5, capLo: 0.3, addUp: 0 },
+    P4: { buy: -1, sellUp: 8, sellDown: 5, capLo: 0.5, addUp: 0.3 },
+    P5: { buy: -1, sellUp: 8, sellDown: 5, capLo: 0.5, addUp: 0.5 }
+  };
+
+  function syncComboUI() {
+    var cfg = state.combo;
+    $('cBuy').value = cfg.buy;
+    $('cBuyVal').textContent = fmtPct(cfg.buy, 1);
+    $('cSellUp').value = cfg.sellUp;
+    $('cSellUpVal').textContent = fmtPct(cfg.sellUp, 1);
+    $('cSellDown').value = cfg.sellDown;
+    $('cSellDownVal').textContent = fmtPct(cfg.sellDown, 1);
+    $('cCapLo').value = Math.round(cfg.capLo * 100);
+    $('cCapLoVal').textContent = (cfg.capLo * 100).toFixed(0) + '%';
+    $('cAddUp').value = Math.round(cfg.addUp * 100);
+    $('cAddUpVal').textContent = (cfg.addUp > 0 ? '+' : '') + (cfg.addUp * 100).toFixed(0) + '%';
+    $('cFin').value = cfg.finRate;
+    $('cFinVal').textContent = cfg.finRate + '%/年';
+    $('cCost').value = cfg.costBps;
+    $('cCostVal').textContent = cfg.costBps + ' bps';
+    $('cFin').disabled = cfg.addUp <= 0;
+    $('cFinVal').style.opacity = cfg.addUp <= 0 ? 0.45 : 1;
+  }
+
+  function markComboPresetActive() {
+    var cfg = state.combo;
+    document.querySelectorAll('[data-combo]').forEach(function (el) {
+      var p = COMBO_PRESETS[el.getAttribute('data-combo')];
+      var on = !!p &&
+        Math.abs(p.buy - cfg.buy) < 1e-9 && Math.abs(p.sellUp - cfg.sellUp) < 1e-9 &&
+        Math.abs(p.sellDown - cfg.sellDown) < 1e-9 && Math.abs(p.capLo - cfg.capLo) < 1e-9 &&
+        Math.abs(p.addUp - cfg.addUp) < 1e-9;
+      el.classList.toggle('active', on);
+    });
+  }
+
+  function setEngine(engine) {
+    state.engine = engine;
+    var isCombo = engine === 'combo';
+    document.querySelectorAll('[data-engine]').forEach(function (x) {
+      x.classList.toggle('active', x.getAttribute('data-engine') === engine);
+    });
+    $('panelSimple').style.display = isCombo ? 'none' : '';
+    $('panelCombo').style.display = isCombo ? '' : 'none';
+    $('paramSub').textContent = isCombo
+      ? '组合版：年线（242日）状态决定卖出线与仓位上限｜T 日收盘观察信号，T 日收盘成交（0 日延迟）'
+      : 'T 日收盘观察信号，T 日收盘成交（0 日延迟）；持仓期间吃中证红利全收益指数日收益';
+    if (isCombo) markComboPresetActive(); else markPresetActive();
+  }
 
   function bindControls() {
     document.querySelectorAll('[data-mode]').forEach(function (el) {
@@ -540,6 +1030,13 @@
         document.querySelectorAll('[data-mode]').forEach(function (x) {
           x.classList.toggle('active', x === el);
         });
+        recompute();
+      });
+    });
+
+    document.querySelectorAll('[data-engine]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        setEngine(el.getAttribute('data-engine'));
         recompute();
       });
     });
@@ -589,6 +1086,41 @@
       });
     });
 
+    /* ── 组合版滑块 ── */
+    var comboRanges = [
+      ['cBuy', 'cBuyVal', function (v) { state.combo.buy = v; }],
+      ['cSellUp', 'cSellUpVal', function (v) { state.combo.sellUp = v; }],
+      ['cSellDown', 'cSellDownVal', function (v) { state.combo.sellDown = v; }],
+      ['cCapLo', 'cCapLoVal', function (v) { state.combo.capLo = v / 100; }],
+      ['cAddUp', 'cAddUpVal', function (v) { state.combo.addUp = v / 100; }],
+      ['cFin', 'cFinVal', function (v) { state.combo.finRate = v; }],
+      ['cCost', 'cCostVal', function (v) { state.combo.costBps = v; }]
+    ];
+    comboRanges.forEach(function (r) {
+      $(r[0]).addEventListener('input', function () {
+        r[2](parseFloat(this.value));
+        syncComboUI();
+        markComboPresetActive();
+        recompute();
+      });
+    });
+
+    /* ── 组合版预设 ── */
+    document.querySelectorAll('[data-combo]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        var p = COMBO_PRESETS[el.getAttribute('data-combo')];
+        if (!p) return;
+        state.combo.buy = p.buy;
+        state.combo.sellUp = p.sellUp;
+        state.combo.sellDown = p.sellDown;
+        state.combo.capLo = p.capLo;
+        state.combo.addUp = p.addUp;
+        syncComboUI();
+        markComboPresetActive();
+        recompute();
+      });
+    });
+
     window.addEventListener('resize', function () {
       state.charts.main.resize();
       state.charts.nav.resize();
@@ -620,6 +1152,9 @@
     $('buyVal').textContent = fmtPct(dp.buy, 1);
     $('sellVal').textContent = fmtPct(dp.sell, 1);
     markPresetActive();
+
+    syncComboUI();
+    setEngine('combo');   // 默认进入组合版（年线分档规则）
 
     state.charts.main = echarts.init($('mainChart'));
     state.charts.nav = echarts.init($('navChart'));
