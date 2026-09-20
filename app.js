@@ -47,6 +47,13 @@
     return state.mode === 'wind' ? DATA.series.spread_wind : DATA.series.spread_proxy;
   }
 
+  /*
+   * 成交口径（与 scripts/fetch_data.py 保持一致）
+   *   信号 = spread[i-1]；pos[i] 决定第 i 日是否吃 r_i = divNav[i]/divNav[i-1]。
+   *   => 建仓触发的 pos[entry]=1 是「第 entry-1 日收盘」成交，持有至「第 out-1 日收盘」卖出。
+   *   => 单笔实现收益 = divNav[out-1] / divNav[entry-1] - 1
+   *   故 trades 里 buy/sell 存的是「成交日」在 dates 中的下标（= 信号日下标）。
+   */
   function backtest(divNav, spread, buyTh, sellTh) {
     var n = divNav.length;
     var pos = new Array(n);
@@ -67,7 +74,7 @@
       } else if (cur === 1 && sig > sellTh) {
         pos[i] = 0;
         if (entry !== null) {
-          trades.push({ in: entry, out: i, days: i - entry, ret: (divNav[i] / divNav[entry] - 1) * 100 });
+          trades.push({ buy: entry - 1, sell: i - 1, days: i - entry, ret: (divNav[i - 1] / divNav[entry - 1] - 1) * 100 });
           entry = null;
         }
       } else {
@@ -75,7 +82,7 @@
       }
     }
     if (entry !== null) {
-      trades.push({ in: entry, out: n - 1, days: n - 1 - entry, ret: (divNav[n - 1] / divNav[entry] - 1) * 100, open: true });
+      trades.push({ buy: entry - 1, sell: n - 1, days: n - entry, ret: (divNav[n - 1] / divNav[entry - 1] - 1) * 100, open: true });
     }
 
     var nav = new Array(n);
@@ -222,8 +229,8 @@
     var heldTxt, heldSub;
     if (st.openPosition) {
       var t = st.trades[st.trades.length - 1];
-      heldTxt = (dates.length - 1 - t.in) + ' 天';
-      heldSub = '自 ' + fmtDate(dates[t.in]) + ' 起持有';
+      heldTxt = (dates.length - 1 - t.buy) + ' 天';
+      heldSub = '自 ' + fmtDate(dates[t.buy]) + ' 起持有';
     } else {
       heldTxt = '0 天';
       heldSub = '空仓中';
@@ -272,8 +279,8 @@
       var cls = t.open ? 'open' : (t.ret > 0 ? 'win' : 'lose');
       var tag = t.open ? '<span class="tag tag-open">持有中</span>' : '';
       return '<tr>' +
-        '<td>' + fmtDate(dates[t.in]) + '</td>' +
-        '<td>' + (t.open ? '—' : fmtDate(dates[t.out])) + '</td>' +
+        '<td>' + fmtDate(dates[t.buy]) + '</td>' +
+        '<td>' + (t.open ? '—' : fmtDate(dates[t.sell])) + '</td>' +
         '<td class="num">' + t.days + '</td>' +
         '<td class="num ' + cls + '">' + fmtPct(t.ret, 2) + '</td>' +
         '<td>' + tag + '</td>' +
