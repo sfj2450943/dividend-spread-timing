@@ -154,8 +154,12 @@ def build_series(dividend, market, dates):
 def backtest(div_nav, spread, buy_th, sell_th):
     """
     收益差择时回测。
-    T 日收盘观察到信号，T+1 日收盘执行 => 第 i 日收益由第 i-1 日信号决定。
-    持仓期间吃中证红利全收益指数的日收益。
+
+    成交口径：信号 = spread[i-1]，pos[i] 决定第 i 日是否吃 r_i = div_nav[i]/div_nav[i-1]。
+    即「第 i-1 日（信号日）收盘成交」，0 日延迟。
+    建仓 pos[entry]=1 => 第 entry-1 日收盘买入；平仓 pos[out]=0 => 第 out-1 日收盘卖出。
+    单笔实现收益 = div_nav[out-1] / div_nav[entry-1] - 1。
+    trades 中的 buy/sell 存「成交日」下标（= 信号日下标），days = sell - buy。
     """
     n = len(div_nav)
     pos = [0] * n
@@ -173,16 +177,16 @@ def backtest(div_nav, spread, buy_th, sell_th):
         elif cur == 1 and prev_sig > sell_th:
             pos[i] = 0
             if entry_i is not None:
-                ret = (div_nav[i] / div_nav[entry_i] - 1.0) * 100.0
-                trades.append({"in": i, "out": i, "days": i - entry_i,
+                ret = (div_nav[i - 1] / div_nav[entry_i - 1] - 1.0) * 100.0
+                trades.append({"buy": entry_i - 1, "sell": i - 1, "days": i - entry_i,
                                "ret": round(ret, 2)})
                 entry_i = None
         else:
             pos[i] = cur
 
     if entry_i is not None:      # 期末仍持有
-        ret = (div_nav[-1] / div_nav[entry_i] - 1.0) * 100.0
-        trades.append({"in": entry_i, "out": n - 1, "days": n - 1 - entry_i,
+        ret = (div_nav[-1] / div_nav[entry_i - 1] - 1.0) * 100.0
+        trades.append({"buy": entry_i - 1, "sell": n - 1, "days": n - entry_i,
                        "ret": round(ret, 2), "open": True})
 
     # 净值曲线
