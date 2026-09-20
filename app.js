@@ -8,6 +8,10 @@
     mode: 'wind',          // 'wind' | 'proxy'
     buyTh: -1.0,
     sellTh: 5.0,
+    maWin: 242,            // 收益差年线窗口（交易日）
+    showMA: true,          // 主图是否叠加年线
+    ma: null,              // 年线序列
+    crossMap: null,        // 索引 → 'up' | 'down'
     raw: null,             // 当前回测结果
     charts: {}
   };
@@ -19,7 +23,10 @@
     zero: '#B4B2A9',
     strat: '#185FA5',
     hold: '#888780',
-    band: 'rgba(55,138,221,0.10)'
+    band: 'rgba(55,138,221,0.10)',
+    ma: '#E24B4A',         // 年线（文中红色虚线，此处实线）
+    crossUp: '#E24B4A',    // 上穿 0 轴（红涨）
+    crossDown: '#1D9E75'   // 下穿 0 轴（绿跌）
   };
 
   function $(id) { return document.getElementById(id); }
@@ -141,6 +148,54 @@
     return c / clean.length * 100;
   }
 
+  /* ───────── 收益差年线（242 日均线）与 0 轴穿越 ───────── */
+
+  function isValid(v) { return v !== null && v !== undefined && !isNaN(v); }
+
+  // 前缀和实现：窗口内必须恰好 w 个有效值才输出，遇缺口则该点为空
+  function maArray(arr, w) {
+    var n = arr.length;
+    var out = new Array(n);
+    var psum = new Array(n + 1);
+    var pcnt = new Array(n + 1);
+    psum[0] = 0; pcnt[0] = 0;
+    for (var i = 0; i < n; i++) {
+      var v = arr[i];
+      var ok = isValid(v);
+      psum[i + 1] = psum[i] + (ok ? v : 0);
+      pcnt[i + 1] = pcnt[i] + (ok ? 1 : 0);
+      if (i + 1 >= w && (pcnt[i + 1] - pcnt[i + 1 - w]) === w) {
+        out[i] = (psum[i + 1] - psum[i + 1 - w]) / w;
+      } else {
+        out[i] = null;
+      }
+    }
+    return out;
+  }
+
+  // 年线穿越 0 轴：上穿 = 前值 < 0 且现值 ≥ 0；下穿反之
+  function buildCross(ma) {
+    var up = [], down = [], map = {};
+    for (var i = 1; i < ma.length; i++) {
+      var a = ma[i - 1], b = ma[i];
+      if (!isValid(a) || !isValid(b)) continue;
+      if (a < 0 && b >= 0) { up.push([i, b]); map[i] = 'up'; }
+      else if (a >= 0 && b < 0) { down.push([i, b]); map[i] = 'down'; }
+    }
+    return { up: up, down: down, map: map };
+  }
+
+  // 最近一次穿越（从末尾往回找）
+  function lastCross(ma) {
+    for (var i = ma.length - 1; i > 0; i--) {
+      var a = ma[i - 1], b = ma[i];
+      if (!isValid(a) || !isValid(b)) continue;
+      if (a < 0 && b >= 0) return { i: i, dir: 'up' };
+      if (a >= 0 && b < 0) return { i: i, dir: 'down' };
+    }
+    return null;
+  }
+
   /* ───────── 渲染 ───────── */
 
   function renderKPI() {
@@ -180,6 +235,16 @@
     $('kpiPct').textContent = p3 === null ? '—' : p3.toFixed(0) + '%';
     $('kpiPctSub').textContent = '近 3 年 · 全历史 ' +
       (percentile(s, cur) === null ? '—' : percentile(s, cur).toFixed(0) + '%');
+
+    // 趋势卡：收益差年线（242 日）
+    var ma = state.ma || [];
+    var mv = ma[last];
+    $('kpiMA').textContent = fmtPct(mv, 2);
+    $('kpiMA').style.color = !isValid(mv) ? 'inherit' : (mv >= 0 ? COLOR.crossUp : COLOR.crossDown);
+    var lc = lastCross(ma);
+    var side = !isValid(mv) ? '数据不足' : (mv >= 0 ? '0 轴上方 · 红利偏强' : '0 轴下方 · 红利偏弱');
+    $('kpiMAsub').textContent = side +
+      (lc ? ' · 最近' + (lc.dir === 'up' ? '上穿 ' : '下穿 ') + fmtDate(dates[lc.i]) : '');
   }
 
   function renderStats() {
@@ -247,26 +312,40 @@
 
     var opt = {
       animation: false,
-      grid: { left: 56, right: 24, top: 28, bottom: 64 },
+      grid: { left: 56, right: 24, top: 48, bottom: 64 },
+      legend: {
+        top: 0, left: 0, itemWidth: 14, itemHeight: 8, itemGap: 16,
+        textStyle: { color: '#5F5E5A', fontSize: 12 },
+        data: ['收益差', '收益差年线 242日', '上穿 0 轴', '下穿 0 轴']
+      },
       tooltip: {
         trigger: 'axis',
         axisPointer: { type: 'line', lineStyle: { color: COLOR.zero } },
         formatter: function (ps) {
-          var d = ps[0].axisValue;
-          var row = '<div class="tt-date">' + d + '</div>';
-          ps.forEach(function (p) {
-            if (p.seriesName !== '收益差') return;
-            // 类目轴 + 数值数组时 p.value 本身就是数字；兼容 [x, y] 形式
-            var v = (p.value !== null && typeof p.value === 'object') ? p.value[1] : p.value;
-            row += '<div class="tt-row"><span class="tt-dot" style="background:' + COLOR.spread + '"></span>' +
-              '收益差 <b>' + fmtPct(v, 2) + '</b></div>';
-            if (state.raw && state.raw.pos) {
-              var held = state.raw.pos[p.dataIndex] === 1;
-              row += '<div class="tt-row"><span class="tt-dot" style="background:' +
-                (held ? COLOR.strat : COLOR.zero) + '"></span>' +
-                '仓位 <b>' + (held ? '持有' : '空仓') + '</b></div>';
-            }
-          });
+          var main = null, k;
+          for (k = 0; k < ps.length; k++) { if (ps[k].seriesName === '收益差') { main = ps[k]; break; } }
+          if (!main) return '';
+          var di = main.dataIndex;
+          var v = (main.value !== null && typeof main.value === 'object') ? main.value[1] : main.value;
+          var row = '<div class="tt-date">' + main.axisValue + '</div>';
+          row += '<div class="tt-row"><span class="tt-dot" style="background:' + COLOR.spread + '"></span>' +
+            '收益差 <b>' + fmtPct(v, 2) + '</b></div>';
+          if (state.showMA && isValid(state.ma[di])) {
+            row += '<div class="tt-row"><span class="tt-dot" style="background:' + COLOR.ma + '"></span>' +
+              '年线 242日 <b>' + fmtPct(state.ma[di], 2) + '</b></div>';
+          }
+          if (state.showMA && state.crossMap && state.crossMap[di]) {
+            var dir = state.crossMap[di];
+            row += '<div class="tt-row"><span class="tt-dot" style="background:' +
+              (dir === 'up' ? COLOR.crossUp : COLOR.crossDown) + '"></span>年线 <b>' +
+              (dir === 'up' ? '上穿' : '下穿') + ' 0 轴</b></div>';
+          }
+          if (state.raw && state.raw.pos) {
+            var held = state.raw.pos[di] === 1;
+            row += '<div class="tt-row"><span class="tt-dot" style="background:' +
+              (held ? COLOR.strat : COLOR.zero) + '"></span>' +
+              '仓位 <b>' + (held ? '持有' : '空仓') + '</b></div>';
+          }
           return row;
         }
       },
@@ -334,6 +413,37 @@
           symbolSize: 5,
           itemStyle: { color: COLOR.sell, opacity: 0.85 },
           tooltip: { show: false }
+        },
+        {
+          name: '收益差年线 242日',
+          type: 'line',
+          data: state.showMA ? state.ma : [],
+          showSymbol: false,
+          lineStyle: { width: 1.6, color: COLOR.ma },
+          connectNulls: false,
+          z: 3,
+          tooltip: { show: false }
+        },
+        {
+          name: '上穿 0 轴',
+          type: 'scatter',
+          data: state.showMA && state.cross ? state.cross.up : [],
+          symbol: 'triangle',
+          symbolSize: 9,
+          itemStyle: { color: COLOR.crossUp },
+          z: 4,
+          tooltip: { show: false }
+        },
+        {
+          name: '下穿 0 轴',
+          type: 'scatter',
+          data: state.showMA && state.cross ? state.cross.down : [],
+          symbol: 'triangle',
+          symbolRotate: 180,
+          symbolSize: 9,
+          itemStyle: { color: COLOR.crossDown },
+          z: 4,
+          tooltip: { show: false }
         }
       ]
     };
@@ -397,7 +507,15 @@
 
   function recompute() {
     var divNav = DATA.series.div_nav;
-    state.raw = backtest(divNav, spreadArray(), state.buyTh, state.sellTh);
+    var sp = spreadArray();
+    // 口径标签随 mode 同步（原先只在 applyData 里赋一次，切换口径时不刷新）
+    $('mktCode').textContent = state.mode === 'wind'
+      ? DATA.meta.market_wind.code
+      : DATA.meta.market_proxy.code;
+    state.ma = maArray(sp, state.maWin);
+    state.cross = buildCross(state.ma);
+    state.crossMap = state.cross.map;
+    state.raw = backtest(divNav, sp, state.buyTh, state.sellTh);
     state.bh = buyAndHold(divNav);
     renderKPI();
     renderStats();
@@ -418,6 +536,16 @@
         recompute();
       });
     });
+
+    var maBtn = $('maToggle');
+    if (maBtn) {
+      maBtn.classList.toggle('active', state.showMA);
+      maBtn.addEventListener('click', function () {
+        state.showMA = !state.showMA;
+        maBtn.classList.toggle('active', state.showMA);
+        renderMainChart();
+      });
+    }
 
     $('buySlider').addEventListener('input', function () {
       var v = parseFloat(this.value);
@@ -476,7 +604,6 @@
     $('span').textContent = fmtDate(d.meta.start) + ' → ' + fmtDate(d.meta.end) +
       ' · ' + d.meta.trading_days + ' 个交易日 · 窗口 ' + d.meta.window + ' 日';
     $('divCode').textContent = d.meta.dividend.code;
-    $('mktCode').textContent = state.mode === 'wind' ? d.meta.market_wind.code : d.meta.market_proxy.code;
 
     var dp = d.presets.filter(function (p) { return p.name === d.default_preset; })[0] || d.presets[0];
     state.buyTh = dp.buy;
