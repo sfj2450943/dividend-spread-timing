@@ -479,12 +479,15 @@
     $('kpiSignalSub').textContent = sg.sub;
 
     var heldTxt, heldSub;
+    var segs = state.raw.trades || [];   // 注意：stats 里没有 trades，持仓段在 raw.trades
     if (state.engine === 'combo') {
       $('kpiHeldLb').textContent = '当前仓位';
       var curW = r.w[dates.length - 1];
       heldTxt = (curW * 100).toFixed(0) + '%';
-      if (curW > 0) {
-        heldSub = '最近一次调仓 ' + fmtDate(dates[st.trades[st.trades.length - 1].buy]);
+      if (curW > 0 && segs.length) {
+        heldSub = '最近一次调仓 ' + fmtDate(dates[segs[segs.length - 1].buy]);
+      } else if (curW > 0) {
+        heldSub = '持仓中';
       } else {
         var nt2 = comboNextTarget();
         heldSub = (nt2.hold && nt2.tgt > 0)
@@ -493,8 +496,8 @@
       }
     } else {
       $('kpiHeldLb').textContent = '已持有';
-      if (st.openPosition) {
-        var t = st.trades[st.trades.length - 1];
+      if (st.openPosition && segs.length) {
+        var t = segs[segs.length - 1];
         heldTxt = (dates.length - 1 - t.buy) + ' 天';
         heldSub = '自 ' + fmtDate(dates[t.buy]) + ' 起持有';
       } else {
