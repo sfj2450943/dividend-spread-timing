@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  issues: write        # 失败告警要开/关 issue
 
 concurrency:
   group: update-data
@@ -18,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 配置 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -60,3 +61,85 @@ jobs:
             git commit -m "chore(data): 更新 40日收益差数据 $(date -u '+%Y-%m-%d %H:%M UTC')"
             git push
           fi
+
+      # 2026-11 那次 Wind 接口故障：11-10~11-18 连续 7 个交易日失败，
+      # 全程零告警，直到 11-19 上游自愈才恢复。页面兜底数据静默陈旧了 2 个月。
+      # 下面两步把告警做成闭环：失败开单 / 恢复关单。
+      - name: 失败告警（开单或追评）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, urllib.request
+
+          tok, repo = os.environ["GH_TOKEN"], os.environ["REPO"]
+          run_url = os.environ["RUN_URL"]
+          now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          PREFIX = "[自动化] 数据更新失败"
+
+          def api(method, path, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(
+                  "https://api.github.com" + path, data=data, method=method,
+                  headers={"Authorization": "Bearer " + tok,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json",
+                           "User-Agent": "wb-alert"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read().decode() or "null")
+
+          issues = api("GET", "/repos/%s/issues?state=open&per_page=100" % repo) or []
+          hit = next((i for i in issues
+                      if i["title"].startswith(PREFIX) and "pull_request" not in i), None)
+
+          detail = ("失败时间：%s\n运行记录：%s\n\n"
+                    "排查顺序：① 打开该次运行 `拉取 Wind 数据` 步骤日志，看 "
+                    "`Wind MCP 调用失败` 后面的完整报错（现在会带上响应体原文）；"
+                    "② 若报「拒绝访问」或 HTTP 401/403，是凭据/额度问题；"
+                    "③ 若连续多日失败，页面会标出「数据可能陈旧」，先确认上游是否恢复。"
+                    % (now, run_url))
+
+          if hit:
+              api("POST", "/repos/%s/issues/%d/comments" % (repo, hit["number"]),
+                  {"body": "**再一次失败** · " + detail})
+              print("已追加评论到 issue #%d" % hit["number"])
+          else:
+              r = api("POST", "/repos/%s/issues" % repo,
+                      {"title": "%s %s" % (PREFIX, now[:10]), "body": detail})
+              print("已开 issue #%d" % r["number"])
+          PY
+
+      - name: 恢复正常（关闭告警单）
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          tok, repo = os.environ["GH_TOKEN"], os.environ["REPO"]
+          PREFIX = "[自动化] 数据更新失败"
+
+          def api(method, path, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(
+                  "https://api.github.com" + path, data=data, method=method,
+                  headers={"Authorization": "Bearer " + tok,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json",
+                           "User-Agent": "wb-alert"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read().decode() or "null")
+
+          issues = api("GET", "/repos/%s/issues?state=open&per_page=100" % repo) or []
+          for i in issues:
+              if i["title"].startswith(PREFIX) and "pull_request" not in i:
+                  api("POST", "/repos/%s/issues/%d/comments" % (repo, i["number"]),
+                      {"body": "已恢复正常，自动关闭。"})
+                  api("PATCH", "/repos/%s/issues/%d" % (repo, i["number"]), {"state": "closed"})
+                  print("已关闭 issue #%d" % i["number"])
+          PY
