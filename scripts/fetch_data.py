@@ -22,11 +22,14 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
-WIND_ENDPOINT = "https://mcp.wind.com.cn/vserver_index_data/mcp/"
+# 允许用环境变量覆盖，便于本地用假端点做故障演练（见 _tools/test_wind_retry.py）
+WIND_ENDPOINT = os.environ.get("WIND_ENDPOINT",
+                               "https://mcp.wind.com.cn/vserver_index_data/mcp/")
 WINDOW = 40                 # 滚动窗口（交易日）
 TRADING_DAYS_PER_YEAR = 252
 START_DATE = "20131216"     # 中证红利改为股息率加权之日
@@ -45,8 +48,19 @@ PRESETS = [
 
 # ───────────────────────── Wind MCP 调用 ─────────────────────────
 
-def wind_call(tool_name, arguments, api_key, retries=3):
-    """调用 Wind MCP 无状态接口。streamable-http-stateless，无需握手。"""
+def wind_call(tool_name, arguments, api_key, retries=4, backoff=(2, 6, 18)):
+    """调用 Wind MCP 无状态接口。streamable-http-stateless，无需握手。
+
+    重试策略（2026-11 故障复盘后重写，别退回旧版）：
+      · 旧版 `for attempt in range(3)` 里**没有 sleep**，三次调用挤在 4.5 秒内 ——
+        等于同一瞬间打三发，上游只要短暂不可用就必然全灭。
+        实测 2026-11-10~11-18 连续 7 个交易日失败，每次都是 3 次 warn 后 raise。
+      · 现在改为指数退避 2s/6s/18s，共 4 次尝试（最坏 ~26 秒），能扛住分钟级抖动。
+      · 401/403 是凭据/额度问题，重试无意义 → 立即抛出，不浪费退避时间。
+      · 失败时把响应体原文塞进错误串：上次只看到
+        `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`，
+        完全无法判断上游回的是 HTML 错误页、WAF 挑战页还是空体，只能靠猜。
+    """
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -69,15 +83,31 @@ def wind_call(tool_name, arguments, api_key, retries=3):
                 text = resp.read().decode("utf-8", errors="replace")
             return _parse_mcp_text(text)
         except urllib.error.HTTPError as e:
-            last_err = "HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:300])
+            snippet = e.read().decode("utf-8", "replace")[:200]
+            last_err = "HTTP %s: %s" % (e.code, snippet)
+            if e.code in (401, 403):
+                # 凭据失效 / 额度耗尽 / 被 WAF 拦 —— 再试 3 次也一样
+                raise RuntimeError("Wind MCP 拒绝访问（%s，疑似凭据或额度问题）：%s"
+                                   % (tool_name, last_err))
         except Exception as e:                      # noqa: BLE001
             last_err = "%s: %s" % (type(e).__name__, e)
-        print("  [warn] 第 %d 次调用失败：%s" % (attempt + 1, last_err), file=sys.stderr)
-    raise RuntimeError("Wind MCP 调用失败（%s）：%s" % (tool_name, last_err))
+        print("  [warn] 第 %d/%d 次调用失败：%s" % (attempt + 1, retries, last_err),
+              file=sys.stderr)
+        if attempt < retries - 1:
+            wait = backoff[min(attempt, len(backoff) - 1)]
+            print("  [warn] %d 秒后重试" % wait, file=sys.stderr)
+            time.sleep(wait)
+    raise RuntimeError("Wind MCP 调用失败（%s，已重试 %d 次）：%s"
+                       % (tool_name, retries, last_err))
 
 
 def _parse_mcp_text(text):
-    """兼容 SSE（data: {...}）与纯 JSON 两种返回。"""
+    """兼容 SSE（data: {...}）与纯 JSON 两种返回。
+
+    所有失败分支都必须带上响应体原文片段 —— 否则线上只能看到
+    `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`，
+    无从判断是网关 502 页、WAF 挑战页、维护公告还是真空体。
+    """
     raw = None
     for line in text.splitlines():
         line = line.strip()
@@ -87,15 +117,28 @@ def _parse_mcp_text(text):
     if raw is None:
         raw = text.strip()
     if not raw:
-        raise RuntimeError("Wind MCP 返回空内容")
-    envelope = json.loads(raw)
+        raise RuntimeError("Wind MCP 返回空内容（响应长度 %d 字节）" % len(text))
+
+    head = raw.lstrip()[:200]
+    looks_html = head[:1] == "<" or head[:9].lower() == "<!doctype"
+    try:
+        envelope = json.loads(raw)
+    except ValueError:
+        raise RuntimeError(
+            "Wind MCP 返回非 JSON%s（共 %d 字节，前 200 字符：%r）"
+            % ("，疑似网关/WAF 错误页" if looks_html else "", len(raw), head))
+
     if "error" in envelope and envelope["error"]:
         raise RuntimeError("Wind MCP 业务错误：%s" % envelope["error"])
     content = envelope.get("result", {}).get("content") or []
     if not content:
-        raise RuntimeError("Wind MCP 返回无 content 字段")
+        raise RuntimeError("Wind MCP 返回无 content 字段（信封键：%s）"
+                           % list(envelope)[:8])
     inner = content[0].get("text", "")
-    data = json.loads(inner)
+    try:
+        data = json.loads(inner)
+    except ValueError:
+        raise RuntimeError("Wind MCP content 非 JSON（前 200 字符：%r）" % inner[:200])
     if data.get("error"):
         raise RuntimeError("Wind MCP 数据错误：%s" % data["error"])
     return data.get("data") or {}
