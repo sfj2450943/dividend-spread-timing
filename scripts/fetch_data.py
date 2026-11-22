@@ -324,12 +324,23 @@ def find_sell_days(dates, spread, sell_th):
     return out
 
 
+def published_end(path):
+    """读取已发布版本的 meta.end（YYYYMMDD）。文件不存在/损坏返回 None。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f).get("meta") or {}).get("end")
+    except (OSError, ValueError):
+        return None
+
+
 # ───────────────────────── 主流程 ─────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join("data", "data.json"))
     ap.add_argument("--start", default=START_DATE)
+    ap.add_argument("--allow-backstep", action="store_true",
+                    help="允许末期数据早于已发布版本（上游永久性修正历史时才用）")
     args = ap.parse_args()
 
     api_key = os.environ.get("WIND_API_KEY", "").strip()
@@ -355,6 +366,22 @@ def main():
         print("错误：共同交易日不足（%d）" % len(dates), file=sys.stderr)
         return 3
     print("共同交易日：%d（%s → %s）" % (len(dates), dates[0], dates[-1]))
+
+    # 防倒退：dates 是三个源的**交集**，任一源尾部延迟或正在修正，交集就会缩短。
+    # 此时直接覆盖等于把已发布数据回退一天 —— 2026-11-22 实测：881001.WI 少了 11-20
+    # （3143 vs 3144），一次手动重跑就把线上从 11-20 退到了 11-19，且页面看不出异常。
+    # 策略：宁可这次不更新（等上游补齐），也不能用残缺数据覆盖完好的数据。
+    prev_end = published_end(args.out)
+    if prev_end and dates[-1] < prev_end and not args.allow_backstep:
+        missing = [c for c in (DIVIDEND[0], MARKET_WIND[0], MARKET_PROXY[0])
+                   if prev_end not in series[c]]
+        print("错误：新数据末日 %s 早于已发布 %s，拒绝写入（已有数据保持不变）。"
+              % (dates[-1], prev_end), file=sys.stderr)
+        print("      缺少 %s 的来源：%s" % (prev_end, ", ".join(missing) or "未知"),
+              file=sys.stderr)
+        print("      多为某个源尾部延迟/正在修正，等上游补齐后重跑即可；"
+              "确认是永久性修正时加 --allow-backstep。", file=sys.stderr)
+        return 4
 
     div_nav = [div_c[d] for d in dates]
     base = div_nav[0]
